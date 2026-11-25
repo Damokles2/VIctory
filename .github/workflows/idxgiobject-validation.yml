@@ -1,0 +1,134 @@
+name: IDXGIObject Windows MSVC validation
+
+on:
+  push:
+    branches: [ci/idxgiobject-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.repository == 'Damokles2/VIctory' && github.event.deleted == false
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      BASE_SHA: 940d32f69b22265690a0b5a15d6ded572ba33baf
+      PATCH_SHA: d4672a6f15f9c944a4d0bbd856b6b2aec1e81d74
+      DXGI_SOURCE: crates/victory-gpu/src/dxgi.rs
+      REGRESSION: dxgi::tests::dxgi_interfaces_expose_their_base_object
+      MSVC_TARGET: x86_64-pc-windows-msvc
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: '0'
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+
+      - name: Verify and prepare source trees
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ((git rev-parse HEAD) -cne $env:GITHUB_SHA -or (git rev-parse HEAD^) -cne $env:PATCH_SHA -or (git rev-parse HEAD^^) -cne $env:BASE_SHA) {
+            throw 'Unexpected validation, contribution, or baseline commit'
+          }
+          if ((git diff --name-only $env:BASE_SHA $env:PATCH_SHA) -cne $env:DXGI_SOURCE) {
+            throw 'Unexpected contribution diff'
+          }
+          git diff --check $env:BASE_SHA $env:PATCH_SHA
+          $baseline = Join-Path $env:RUNNER_TEMP 'idxgiobject-baseline'
+          $patched = Join-Path $env:RUNNER_TEMP 'idxgiobject-patched'
+          $diff = Join-Path $env:GITHUB_WORKSPACE '.github/validation/idxgiobject-baseline.diff'
+          git worktree add --detach $baseline $env:BASE_SHA
+          git worktree add --detach $patched $env:PATCH_SHA
+          git -C $baseline apply --check --index --unidiff-zero $diff
+          git -C $baseline apply --index --unidiff-zero $diff
+          if ((git -C $baseline diff --cached --name-only) -cne $env:DXGI_SOURCE -or (git -C $baseline diff --cached --numstat) -cne "109`t0`t$env:DXGI_SOURCE") {
+            throw 'Unexpected test-only diff'
+          }
+          git -C $baseline diff --cached --check
+          $testPattern = '(?ms)^    #\[test\]\n    fn dxgi_interfaces_expose_their_base_object\(\) \{\n.*?^    \}'
+          $baselineTest = [regex]::Match((Get-Content -Raw (Join-Path $baseline $env:DXGI_SOURCE)), $testPattern).Value
+          $patchedTest = [regex]::Match((Get-Content -Raw (Join-Path $patched $env:DXGI_SOURCE)), $testPattern).Value
+          if (!$baselineTest -or $baselineTest -cne $patchedTest) {
+            throw 'The baseline and patched regressions differ'
+          }
+          "BASELINE_PATH=$baseline" >> $env:GITHUB_ENV
+          "PATCHED_PATH=$patched" >> $env:GITHUB_ENV
+
+      - name: Install pinned Rust toolchain
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustup toolchain install
+          rustc -vV
+
+      - name: Compile baseline tests
+        working-directory: ${{ env.BASELINE_PATH }}
+        run: cargo test --locked -p victory-gpu --lib --target $env:MSVC_TARGET --no-run
+
+      - name: Verify baseline rejects IDXGIObject
+        working-directory: ${{ env.BASELINE_PATH }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $result = cargo test --locked -p victory-gpu --lib --target $env:MSVC_TARGET $env:REGRESSION -- --exact --nocapture 2>&1 | ForEach-Object ToString
+          $exitCode = $LASTEXITCODE
+          $result | Write-Output
+          $expected = 'IDXGIObject queries failed: device: HRESULT 0x80004002, null=true; adapter: HRESULT 0x80004002, null=true; factory: HRESULT 0x80004002, null=true; output: HRESULT 0x80004002, null=true'
+          $testName = [regex]::Escape($env:REGRESSION)
+          if ($exitCode -ne 101 -or $result -cnotcontains 'running 1 test' -or $result -cnotcontains "test $env:REGRESSION ... FAILED" -or @($result -cmatch "^thread '$testName' .*panicked").Count -ne 1 -or @($result -cmatch '^test result: FAILED\. 0 passed; 1 failed; 0 ignored;').Count -ne 1 -or $result -cnotcontains $expected) {
+            throw 'Baseline did not fail solely with the four expected IDXGIObject rejections'
+          }
+          'Baseline regression: expected rejection on all four interfaces.' >> $env:GITHUB_STEP_SUMMARY
+          exit 0
+
+      - name: Compile patched tests
+        working-directory: ${{ env.PATCHED_PATH }}
+        run: cargo test --locked -p victory-gpu --lib --target $env:MSVC_TARGET --no-run
+
+      - name: Run patched CPU-only tests
+        working-directory: ${{ env.PATCHED_PATH }}
+        run: |
+          function Assert-TestRun {
+            param([string[]]$Filter, [string[]]$Expected, [int]$Ignored = 0)
+            $result = cargo test --locked -p victory-gpu --lib --target $env:MSVC_TARGET @Filter 2>&1 | ForEach-Object ToString
+            $exitCode = $LASTEXITCODE
+            $result | Write-Output
+            $total = $Expected.Count + $Ignored
+            $summary = "^test result: ok\. $($Expected.Count) passed; 0 failed; $Ignored ignored;"
+            if ($exitCode -ne 0 -or $result -cnotcontains "running $total test$(if ($total -ne 1) { 's' })" -or @($result -cmatch $summary).Count -ne 1) {
+              throw "Unexpected test result for $($Filter[0])"
+            }
+            foreach ($name in $Expected) {
+              if ($result -cnotcontains "test $name ... ok") {
+                throw "Expected test did not pass: $name"
+              }
+            }
+            "- $($Filter[0]): $($Expected.Count) passed, $Ignored ignored." >> $env:GITHUB_STEP_SUMMARY
+          }
+
+          $PSNativeCommandUseErrorActionPreference = $false
+          Assert-TestRun -Filter @($env:REGRESSION, '--', '--exact', '--nocapture') -Expected @($env:REGRESSION)
+          Assert-TestRun -Filter @('dxgi::tests::') -Expected @(
+            $env:REGRESSION,
+            'dxgi::tests::startup_walks_from_device_to_output',
+            'dxgi::tests::out_of_range_enumeration_clears_output'
+          )
+          Assert-TestRun -Filter @('object::tests::') -Expected @(
+            'object::tests::private_data_is_scoped_to_object_and_id',
+            'object::tests::final_release_clears_private_data_before_drop',
+            'object::tests::guids_round_trip_through_text',
+            'object::tests::every_object_answers_for_iunknown'
+          ) -Ignored 1
+          $deviceTest = 'device::tests::the_device_is_found_at_every_level_through_others'
+          Assert-TestRun -Filter @($deviceTest, '--', '--exact') -Expected @($deviceTest)
+
+      - name: Strict Clippy
+        working-directory: ${{ env.PATCHED_PATH }}
+        run: cargo clippy --locked -p victory-gpu --all-targets --target $env:MSVC_TARGET -- -D warnings
+
+      - name: Check formatting
+        working-directory: ${{ env.PATCHED_PATH }}
+        run: rustfmt --check --edition 2024 crates/victory-gpu/src/dxgi.rs
