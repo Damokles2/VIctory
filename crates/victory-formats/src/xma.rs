@@ -25,6 +25,9 @@ pub const FRAME_SAMPLES: usize = 512;
 /// Samples per channel in one subframe, the unit of skips and loop ends.
 pub const SUBFRAME_SAMPLES: usize = 128;
 const LENGTH_BITS: u32 = 15;
+const INVALID_FRAME_BITS: usize = (1 << LENGTH_BITS) - 1;
+/// Maximum number of bytes needed to gather one encoded frame.
+pub const MAX_FRAME_BYTES: usize = (INVALID_FRAME_BITS - 1).div_ceil(8);
 /// 512 >> 2: the smallest subframe.
 const MIN_SUBFRAME: usize = SUBFRAME_SAMPLES;
 const BLOCK_SIZES: usize = 3;
@@ -72,6 +75,17 @@ pub struct Frame {
     /// Bit offset in the buffer where it starts, and where the next frame
     /// starts (`None` when the buffer has no further frame).
     pub start: usize,
+    pub next: Option<usize>,
+}
+
+/// Length and packet positions of a frame gathered into a caller's buffer.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FramePosition {
+    /// Length in bits, including the frame's length field.
+    pub bits: usize,
+    /// Bit offset of this frame in the packet buffer.
+    pub start: usize,
+    /// Bit offset of the next frame, if one follows in the buffer.
     pub next: Option<usize>,
 }
 
@@ -126,28 +140,43 @@ impl Cursor<'_> {
 /// Reads the frame starting at bit `start` (a frame start inside a packet's
 /// payload) of `data`, a buffer of whole packets of one stream.
 pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
-    let mut cursor = Cursor { data, pos: start };
-    let bits = cursor.bits(LENGTH_BITS)? as usize;
-    if bits <= LENGTH_BITS as usize || bits == 0x7fff {
-        return None;
-    }
-    let mut out = Vec::with_capacity(bits.div_ceil(8));
-    let mut cursor = Cursor { data, pos: start };
-    for _ in 0..bits / 8 {
-        out.push(cursor.byte()?);
-    }
-    let tail = (bits % 8) as u32;
-    if tail != 0 {
-        out.push((cursor.bits(tail)? << (8 - tail)) as u8);
-    }
-    let end = cursor.pos;
-    let next = next_frame(data, start, end);
+    let mut out = Vec::new();
+    let FramePosition { bits, start, next } = read_frame_into(data, start, &mut out)?;
     Some(Frame {
         data: out,
         bits,
         start,
         next,
     })
+}
+
+/// Gathers a frame into reusable storage. Replaces the previous contents
+/// and leaves the buffer empty if the frame cannot be read.
+pub fn read_frame_into(data: &[u8], start: usize, out: &mut Vec<u8>) -> Option<FramePosition> {
+    out.clear();
+    let mut cursor = Cursor { data, pos: start };
+    let bits = cursor.bits(LENGTH_BITS)? as usize;
+    if bits <= LENGTH_BITS as usize || bits == INVALID_FRAME_BITS {
+        return None;
+    }
+    out.reserve_exact(bits.div_ceil(8));
+    let mut cursor = Cursor { data, pos: start };
+    let gathered = (|| {
+        for _ in 0..bits / 8 {
+            out.push(cursor.byte()?);
+        }
+        let tail = (bits % 8) as u32;
+        if tail != 0 {
+            out.push((cursor.bits(tail)? << (8 - tail)) as u8);
+        }
+        Some(cursor.pos)
+    })();
+    let Some(end) = gathered else {
+        out.clear();
+        return None;
+    };
+    let next = next_frame(data, start, end);
+    Some(FramePosition { bits, start, next })
 }
 
 /// Where the frame after the one at `start`..`end` begins: right after it,
@@ -1187,6 +1216,62 @@ mod tests {
                 data[(pos + i) / 8] |= 1 << (7 - (pos + i) % 8);
             }
         }
+    }
+
+    #[test]
+    fn frame_buffer_reuse_preserves_packet_positions_and_clears_failed_reads() {
+        let mut first_voice = vec![0u8; PACKET_BYTES];
+        let (first, second) = (HEADER_BITS + 3, HEADER_BITS + 3 + 37);
+        put_bits(&mut first_voice, 0, 32, 2 << 26 | 3 << 11);
+        put_bits(&mut first_voice, first, LENGTH_BITS, 37);
+        put_bits(&mut first_voice, first + 15, 22, 0x23_4567);
+        put_bits(&mut first_voice, second, LENGTH_BITS, 45);
+        put_bits(&mut first_voice, second + 15, 30, 0x1234_5678);
+
+        // The largest frame starts unaligned and skips the other stream's
+        // packet at index 1. Its payload then spans packets 2 and 3.
+        let mut second_voice = vec![0u8; 4 * PACKET_BYTES];
+        let longest = INVALID_FRAME_BITS - 1;
+        put_bits(&mut second_voice, 0, 32, 1 << 26 | 3 << 11 | 1);
+        put_bits(&mut second_voice, first, LENGTH_BITS, longest as u32);
+        second_voice[PACKET_BYTES..2 * PACKET_BYTES].fill(0xff);
+        second_voice[2 * PACKET_BYTES + 4] = 0x5a;
+        second_voice[3 * PACKET_BYTES + 4] = 0xc3;
+
+        // The length field and payload are MSB first. The final three
+        // bits of each short frame's gathered byte sequence are zero padding.
+        let first_bytes: &[u8] = &[0x00, 0x4b, 0x1a, 0x2b, 0x38];
+        let second_bytes: &[u8] = &[0x00, 0x5a, 0x91, 0xa2, 0xb3, 0xc0];
+        let mut longest_bytes = [0; MAX_FRAME_BYTES];
+        longest_bytes[..2].copy_from_slice(&[0xff, 0xfc]);
+        // The two continuation bytes start at payload bits 16,349 and
+        // 32,701, five bits into their respective gathered bytes.
+        longest_bytes[2043..2045].copy_from_slice(&[0x02, 0xd0]);
+        longest_bytes[4087..4089].copy_from_slice(&[0x06, 0x18]);
+        let longest_bytes = longest_bytes.as_slice();
+
+        let mut scratch = Vec::with_capacity(MAX_FRAME_BYTES);
+        let capacity = scratch.capacity();
+        for (stream, start, bits, next, expected) in [
+            (&first_voice, second, 45, None, second_bytes),
+            (&second_voice, first, longest, None, longest_bytes),
+            (&first_voice, first, 37, Some(second), first_bytes),
+            (&second_voice, first, longest, None, longest_bytes),
+            (&first_voice, second, 45, None, second_bytes),
+        ] {
+            let info = read_frame_into(stream, start, &mut scratch).unwrap();
+            assert_eq!(info, FramePosition { bits, start, next });
+            assert_eq!(scratch, expected);
+            assert_eq!(read_frame(stream, start).unwrap().data, expected);
+            assert_eq!(scratch.capacity(), capacity);
+        }
+        assert!(read_frame_into(&second_voice[..3 * PACKET_BYTES], first, &mut scratch).is_none());
+        assert!(scratch.is_empty(), "a partially read frame must not remain");
+        assert!(read_frame_into(&first_voice, second, &mut scratch).is_some());
+        assert_eq!(scratch, second_bytes);
+        assert!(read_frame_into(&[], 0, &mut scratch).is_none());
+        assert!(scratch.is_empty(), "a header failure must clear old data");
+        assert_eq!(scratch.capacity(), capacity);
     }
 
     /// A damaged packet whose first frame says it is 0 bits long: finding

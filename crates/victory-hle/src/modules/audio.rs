@@ -531,14 +531,15 @@ impl Xma {
     }
 
     /// Fills every enabled context's output as far as it has room.
-    fn pump(&self) {
+    fn pump(&self, encoded: &mut Vec<u8>) {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
-                pump(context, voice);
+            if let (Some(context), Some(voice)) = (
+                self.context(index),
+                &mut *lock(&self.voices[index as usize]),
+            ) {
+                pump(context, voice, encoded);
                 active += 1;
             }
         }
@@ -549,13 +550,13 @@ impl Xma {
     }
 }
 
-fn pump(context: Context, voice: &mut Voice) {
+fn pump(context: Context, voice: &mut Voice, encoded: &mut Vec<u8>) {
     let size = context.field(0, 22, 5);
     if size == 0 {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
+        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice, encoded) {
             return;
         }
         // The write block is the title's too: taken modulo the ring before
@@ -586,7 +587,7 @@ fn pump(context: Context, voice: &mut Voice) {
 
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
-fn decode(context: Context, voice: &mut Voice) -> bool {
+fn decode(context: Context, voice: &mut Voice, encoded: &mut Vec<u8>) -> bool {
     if voice.ended {
         return false;
     }
@@ -623,7 +624,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     if at < 32 {
         at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
     }
-    let Some(frame) = xma::read_frame(data, at) else {
+    let Some(frame) = xma::read_frame_into(data, at, encoded) else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
@@ -634,13 +635,13 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     });
     let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
     voice.trace.frames += 1;
-    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
+    if let Err(e) = decoder.decode(encoded, frame.bits, &mut pcm) {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
                 at,
                 bits = frame.bits,
-                head = ?&frame.data[..frame.data.len().min(8)],
+                head = ?&encoded[..encoded.len().min(8)],
                 %e,
                 "XMA frame did not decode"
             );
@@ -711,8 +712,9 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    let mut encoded = Vec::with_capacity(xma::MAX_FRAME_BYTES);
                     loop {
-                        xma().pump();
+                        xma().pump(&mut encoded);
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
                         std::thread::park_timeout(std::time::Duration::from_millis(2));
                     }
@@ -1104,7 +1106,7 @@ mod tests {
         // so that one that never ends fails this test instead of hanging it.
         let (done, passed) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            xma().pump();
+            xma().pump(&mut Vec::new());
             let _ = done.send(());
         });
         let five = std::time::Duration::from_secs(5);
@@ -1185,7 +1187,7 @@ mod tests {
         // so that one that never ends fails this test instead of hanging it.
         let (done, passed) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            xma().pump();
+            xma().pump(&mut Vec::new());
             let _ = done.send(());
         });
         let five = std::time::Duration::from_secs(5);
@@ -1259,7 +1261,7 @@ mod tests {
             );
         };
         submit(ENABLE_XMA, &[1]);
-        xma().pump();
+        xma().pump(&mut Vec::new());
         // Full: all four blocks written (silence), the write block wrapped
         // onto the read block, and the ring no longer writable.
         assert_eq!(context.field(0, 27, 5), 0);
@@ -1272,7 +1274,7 @@ mod tests {
         // ring keeps room (the decoding thread may fill it too).
         for _ in 0..20 {
             submit(ADVANCE_XMA_READ, &[1, 4]);
-            xma().pump();
+            xma().pump(&mut Vec::new());
             if context.field(2, 31, 1) == 1 && context.field(1, 31, 1) == 1 {
                 break;
             }
@@ -1342,9 +1344,10 @@ mod tests {
                 ended_ms: None,
             },
         };
+        let mut encoded = Vec::new();
         let mut step = |expect_next: u32| {
             let before = voice.pcm.len();
-            assert!(decode(context, &mut voice));
+            assert!(decode(context, &mut voice, &mut encoded));
             assert_eq!(context.field(2, 0, 26), expect_next);
             voice.pcm.len() - before
         };
