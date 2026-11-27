@@ -1,0 +1,82 @@
+name: Signature row Windows benchmark
+on:
+  push:
+    branches: [ci/signature-row-bench]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    if: github.repository == 'Damokles2/VIctory'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      BASE_REV: 63bcca43c6a00a758510398fa43096ce7e4f7df0
+      FEATURE_REV: aa5f45ec805543b03f80f75fcaf412099a86fa3d
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install pinned MSVC toolchain
+        run: rustup toolchain install
+      - name: Verify feature revisions and scoped formatting
+        shell: pwsh
+        run: |
+          $file = 'crates/victory-shader/src/emit/container.rs'
+          if ((git rev-parse HEAD^) -ne $env:FEATURE_REV -or (git rev-parse "$($env:FEATURE_REV)^") -ne $env:BASE_REV) {
+            throw 'Unexpected benchmark or feature parent'
+          }
+          if ((git diff --name-only $env:BASE_REV $env:FEATURE_REV) -ne $file) { throw 'Unexpected feature files' }
+          git diff --check $env:BASE_REV $env:FEATURE_REV
+          if ($LASTEXITCODE -ne 0) { throw 'Feature whitespace check failed' }
+          $original = Join-Path $env:RUNNER_TEMP 'row-original.rs'
+          [IO.File]::WriteAllText($original, ((git show "$($env:BASE_REV):$file") -join [char]10) + [char]10)
+          $cfg = (Resolve-Path 'rustfmt.toml').Path
+          $before = @(rustfmt --check --edition 2024 --config-path $cfg --config skip_children=true $original | Where-Object { $_ -match '^[-+]' })
+          $after = @(rustfmt --check --edition 2024 --config-path $cfg --config skip_children=true $file | Where-Object { $_ -match '^[-+]' })
+          if (Compare-Object $before $after -SyncWindow 0) { throw 'Scoped formatting differs from baseline' }
+          Write-Host 'Scoped formatting matches baseline; feature whitespace check passed.'
+          exit 0
+      - name: Run 144 paired CPU-only workloads
+        shell: pwsh
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP 'signature-row-probe'
+          $results = Join-Path $env:GITHUB_WORKSPACE 'benchmark-results'
+          New-Item -ItemType Directory -Path $scratch,$results | Out-Null
+          foreach ($entry in @(@{Name='baseline'; Sha=$env:BASE_REV},@{Name='optimized'; Sha=$env:FEATURE_REV})) {
+            $dir = Join-Path $scratch $entry.Name
+            New-Item -ItemType Directory -Path $dir | Out-Null
+            'pub(crate) mod container; pub(crate) mod shader; pub(crate) mod bitcode;' | Set-Content -Encoding utf8 (Join-Path $dir 'mod.rs')
+            foreach ($name in @('container.rs','shader.rs','bitcode.rs')) {
+              $source = "crates/victory-shader/src/emit/$name"
+              $lines = git show "$($entry.Sha):$source"
+              if ($LASTEXITCODE -ne 0) { throw "Cannot read $source" }
+              [IO.File]::WriteAllText((Join-Path $dir $name), ($lines -join [char]10) + [char]10)
+            }
+          }
+          rustc -vV | Set-Content (Join-Path $results 'runner.txt')
+          Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Out-String | Add-Content (Join-Path $results 'runner.txt')
+          "base=$env:BASE_REV feature=$env:FEATURE_REV benchmark=$env:GITHUB_SHA" | Add-Content (Join-Path $results 'runner.txt')
+          $src = Join-Path $scratch 'probe.rs'
+          Copy-Item -LiteralPath '.github/benchmarks/signature_rows.rs' -Destination $src
+          $timing = Join-Path $scratch 'timing.exe'
+          $allocation = Join-Path $scratch 'allocation.exe'
+          rustc --edition=2024 -C opt-level=3 -A dead_code --target x86_64-pc-windows-msvc $src -o $timing
+          if ($LASTEXITCODE -ne 0) { throw 'Timing build failed' }
+          rustc --edition=2024 -C opt-level=3 -A dead_code --target x86_64-pc-windows-msvc --cfg count_alloc $src -o $allocation
+          if ($LASTEXITCODE -ne 0) { throw 'Allocation build failed' }
+          $raw = Join-Path $results 'timing-samples.csv'
+          & $timing $raw | Set-Content -Encoding utf8 (Join-Path $results 'timing-summary.csv')
+          if ($LASTEXITCODE -ne 0) { throw 'Timing failed' }
+          & $allocation | Set-Content -Encoding utf8 (Join-Path $results 'allocations.csv')
+          if ($LASTEXITCODE -ne 0) { throw 'Allocation run failed' }
+          if (@(Import-Csv (Join-Path $results 'timing-summary.csv')).Count -ne 144 -or
+              @(Import-Csv $raw).Count -ne 2160 -or
+              @(Import-Csv (Join-Path $results 'allocations.csv')).Count -ne 144) {
+            throw 'Incomplete benchmark matrix'
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: signature-row-windows-msvc
+          path: benchmark-results/
+          if-no-files-found: error
